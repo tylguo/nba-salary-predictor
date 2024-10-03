@@ -1,7 +1,7 @@
 ---
 title: "NBA Player Salary Prediction Model"
 author: "Tyler Guo, Keshav Lodha, Zen Yoshida, Felix Yang"
-date: "`r Sys.Date()`"
+date: "2024-03-17"
 output:
   html_document:
     df_print: paged
