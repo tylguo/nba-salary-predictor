@@ -1,0 +1,471 @@
+---
+title: "NBA Player Salary Prediction Model"
+author: "Tyler Guo, Keshav Lodha, Zen Yoshida, Felix Yang"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+---
+
+
+Introduction and Background
+
+The NBA, or National Basketball Association, is regarded as the premier basketball league in the world, meaning it draws in both the top basketball talent and most revenue. Each team in the NBA has the same operating budget for players, or salary cap.
+
+Statistical tracking of every player has been largely in effect since 1996. There are various statistics based on which the salary of a player is decided. Every team pays their respective players according to what the team believes they are worth. There are many cases in which an under-performing player is paid much more than better performing players on the team. Thus, our motivation in this data analysis project is to determine which player statistics have the most impact on their salary, allowing us to discover which metrics matter most to NBA teams when they are paying players.
+
+Then we wish to build a predictive model off of these individual player statistics to predict a player’s salary based off of their on-court statistics. This will help identify if any player is being over or under paid and on what basis (statistical measurement) we are able to come to this conclusion.
+
+
+
+Introduction to Dataset 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE
+)
+library("httr")
+library("readxl")
+library(dplyr)
+library(ggplot2)
+library(glmnet)
+options(scipen = n)
+GET("https://query.data.world/s/zkeoh5nwm3h5fpm35nfhtbrwy3rg63?dws=00000", write_disk(tf <- tempfile(fileext = ".xlsx")))
+nba_all <- read_excel(tf)
+nba = nba_all %>% filter(Year >= 2010 & Year <= 2016 )
+nba = subset(nba, Salary != 0)
+nba
+```
+
+The dataset we will be using for this project is from the Data World website, given here by this url link: 
+
+https://data.world/nolanoreilly495/nba-data-with-salaries-1996-2017/workspace/file?filename=NBA+Data+With+Salaries.xlsx. 
+
+Data Description:
+Total number of variables: 51 
+Number of categorical variables: 3 (Player Name, Position, & Team) 
+Number of Continuous/Numeric variables: 48 (Salary, Age, etc.) Total Number of rows: 12,377
+
+The data set collects data from the 1996 season to the 2017 season, meaning it spans about two decades of the NBA. However, for the context of this project, we will only be using the most recent 6 years as our data set because inflation and salary cap negotiations have greatly increased the value of the average NBA contract in the last 20 years. 
+
+Our variable of interest is the Salary, as we hope to be able to estimate that value based off of the other statistics. 
+
+
+Exploratory Data Analysis
+
+General Histogram
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+salary_histogram = ggplot(nba, aes(x = Salary)) +
+  geom_histogram(binwidth = 1000000, color = "white", fill = "grey", size = 0.2) + 
+  labs(title = "Distribution of NBA Player Salaries From 2010 to 2016", x = "Salary", y = "Number of Players") + 
+  scale_x_continuous(labels = scales::dollar_format(prefix = "$"), breaks = seq(0, max(nba$Salary), by = 1e7)) + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+salary_histogram
+```
+
+The histogram above gives us a good representation of the problem. The gross majority of players earn less than 5 million dollars a year, and only a select few earn more than 20 million dollars a year. Thus, the problem statement is explaining why certain players earn so much more than others. What do these players do on the court that makes them "worth" so much more money? 
+
+Categorical Variable Analysis 
+
+```{r}
+nba$PrimaryPosition = sapply(strsplit(as.character(nba$Pos), "-"), function(x) x[1])
+nba$PrimaryPosition = factor(nba$PrimaryPosition, levels = c("PG", "SG", "SF", "PF", "C"))
+
+# Salary by position boxplot
+position_boxplot = ggplot(nba, aes(x = PrimaryPosition, y = Salary)) +
+  geom_boxplot() +
+  labs(title = "NBA Player Salaries by Position", x = "Primary Position", y = "Salary") +
+  scale_y_continuous(labels = scales::comma_format(scale = 1, big.mark = ",", decimal.mark = ".", prefix = "$"))
+
+position_boxplot
+```
+
+The plot above shows the salary boxplot for each position. This is the only analysis we will be doing with the player's positions, as this is a categorical variable and we wish to only use continous variables in our prediction models. However, it should be noted that generally speaking, bigger players get paid more. This is because finding a capable 7 footer is much rarer than finding a capable 6 footer, thus taller players, on average, command larger salaries. 
+
+
+Correlation Heatmap
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+continous_var = sapply(nba, is.numeric)
+nba_continous = nba[, continous_var]
+nba_continous = apply(nba_continous, 2, function(x) ifelse(is.na(x), mean(x, na.rm = TRUE), x))
+
+correlation_matrix = cor(nba_continous)
+salary_correlation = correlation_matrix[,"Salary"]
+sorted_correlations = sort(salary_correlation, decreasing = TRUE)
+```
+
+
+```{r}
+library(corrplot)
+selected_variables <- c("Salary" ,"PTS/G", "Age", "AST/G", "STL/G", "VORP", "GS", "TOV/G", "DRB/G", "BPM")
+subset_correlation_matrix <- correlation_matrix[selected_variables, selected_variables]
+
+corrplot(
+  subset_correlation_matrix,
+  method = "color",
+  tl.col = "black",
+  tl.srt = 45,
+  addCoef.col = "black",
+  col = colorRampPalette(c("#2166ac", "#4393c3", "#92c5de", "#d1e5f0", "#f7f7f7", "#fddbc7", "#f4a582", "#d6604d", "#b2182b"))(100), 
+  number.cex = 0.6)
+
+```
+
+Above shows a correlation heatmap of the variables most correlated with Player Salary. Some logical conclusions can be easily drawn here, such as the high correlation between TOV/G (Turnovers Per Game) and PTS/G (Points Per Game), which makes sense as more points = more shots = more time with the ball = more chances for turning the ball over. Certain variables also seem to not have a lot of correlation with other variables, namely the Age variable. 
+
+
+Basic Data Table
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+library(knitr)
+library(dplyr)
+
+
+nba_continuous <- nba %>% select_if(is.numeric)
+nba_continuous <- nba_continuous[selected_variables]
+
+interval_width <- 5e6
+max_salary <- max(nba_continuous$Salary)
+salary_intervals <- seq(0, ceiling(max_salary / interval_width) * interval_width, by = interval_width)
+
+nba_salary_groups <- nba_continuous %>%
+  mutate(Salary_Group = cut(Salary, breaks = salary_intervals, include.lowest = TRUE, labels = FALSE))
+
+salary_group_labels <- sprintf("$%s - $%s", salary_intervals[-length(salary_intervals)], salary_intervals[-1])
+
+salary_group_labels[length(salary_group_labels)] <- "> $30000000"
+
+nba_salary_groups$Salary_Group <- factor(nba_salary_groups$Salary_Group, labels = salary_group_labels)
+
+nba_summary <- nba_salary_groups %>%
+  group_by(Salary_Group) %>%
+  summarize(across(everything(), list(mean = mean, sd = sd), na.rm = TRUE))
+
+nba_summary_df <- as.data.frame(nba_summary)
+nba_summary_df <- nba_summary_df[,-c(2:3)]
+nba_summary_df <- na.omit(nba_summary_df)
+
+(nba_summary_df[,-c(8:43)])
+```
+
+The table above shows a brief overview of each salary range, broken into intervals of 5 million until it hits 30 million, where the rest of the observations are simply binned into the >$30 million range. The table then shows the mean and standard deviation for the most relevant variables (or most correlated) for each salary range. Please note that the table attached above only shows the 3 variables most correlated with salary for the sake of simplicity. A few preliminary conclusions can be ascertained from this table, as the average PPG for each salary range steadily increases as the salary ranges increase, as does average age and assists per game. This seems to suggest a positive relationship between these variables and a player's salary. 
+
+Rounding Salary Values to the Nearest Million
+
+Rounding the Salary Values to the nearest million will allow our prediction models to perform much better and provide more interpretable results for our data analysis
+
+
+```{r}
+nba$Salary = round(nba$Salary / 500000) * 500000
+nba$Salary <- nba$Salary / 1000000
+```
+
+
+Methodology and Testing Results
+
+
+Linear Regression Model: The first model that we will be using on our data set is the linear regression model. We choose this model because it is perhaps the most easily interpretable method due to its simplicity. Furthermore, this model is widely understood and can serve as a baseline for us to operate off of, allowing us to compare our findings using more complex models to the basic linear regression model. 
+
+```{r}
+set.seed(2024)
+library(caret)
+
+nba_new = nba %>% dplyr::select(Player, Salary, `PTS/G`, Age, `AST/G`, `STL/G`, `VORP`, `GS`, `TOV/G`, `DRB/G`, `BPM`)
+numerical_columns <- sapply(nba_new, is.numeric)
+nba_numerical <- nba_new[, numerical_columns]
+
+train_indices <- createDataPartition(nba_numerical$Salary, p = 0.8, list = FALSE)
+train_data <- nba_numerical[train_indices, ]
+test_data <- nba_numerical[-train_indices, ]
+
+fit.lm <- lm(Salary ~ ., data = train_data)
+
+predictions <- predict(fit.lm, newdata = test_data)
+mse <- mean((test_data$Salary - predictions)^2)
+rsquared <- cor(test_data$Salary, predictions)^2
+cat("The Mean Squared Error For Linear Regression is:", mse, fill = T)
+cat("The R squared Value for the Linear Regression Model is:", rsquared, fill = T)
+```
+
+The linear regression model for our data set yields a Mean Squared Value of 10.90282, which is relatively high considering that we rounded salary values and truncated them to the nearest million as well. The coefficient of determination is also somewhat low, at only 0.49625330.5532027, signaling a relatively weak linear correlation between our predicted values and the actual values. 
+
+
+Linear Regression Summary
+
+```{r}
+par(mfrow = c(2, 2))
+#summary(fit.lm)
+plot(fit.lm)
+```
+
+We can view the summary of the linear regression model above, through both the numerical methods and graphical methods. We can ascertain that the linear model has a large amount of residuals and the residuals do not seem to follow a normal distribution, which means that certain parametric methods, such as ANOVA, will be inaccurate. Furthermore, there also seems to be a large amount of outliers, which can be attributed to underpaid and overpaid players. 
+
+
+Ridge Regression: The second model we will be using is the ridge regression model. We choose this model because of its ability to handle multicollinearity. As seen in our exploratory data analysis, many of our predictor variables are correlated with each other, meaning that these independent variables are highly correlated, which might impact their coefficient estimates. Ridge Regression helps mitigate the impact of multicollinearity, allowing us to obtain more reliable coefficient estimates. Furthermore, ridge regression is robust against noisy data, or outliers, which in our case is extremely helpful. 
+
+```{r}
+set.seed(2024)
+
+train_indices <- createDataPartition(nba_numerical$Salary, p = 0.8, list = FALSE)
+train_data <- nba_numerical[train_indices, ]
+test_data <- nba_numerical[-train_indices, ]
+
+preProcValues <- preProcess(train_data[, c("PTS/G", "Age", "AST/G", "STL/G", "VORP", "GS", "TOV/G", "DRB/G", "BPM")], method = c("center", "scale"))
+train_data_scaled <- predict(preProcValues, train_data)
+test_data_scaled <- predict(preProcValues, test_data)
+
+x <- model.matrix(Salary ~ ., data = train_data_scaled)[, -1]
+y <- train_data_scaled$Salary
+ridge_model <- cv.glmnet(x, y, alpha = 0)
+
+x_test <- model.matrix(Salary ~ ., data = test_data_scaled)[, -1]
+predictions_ridge <- predict(ridge_model, newx = x_test, s = "lambda.min")
+
+true_salaries <- test_data_scaled$Salary
+mse_ridge <- mean((true_salaries - predictions_ridge)^2)
+rsquared_ridge <- cor(true_salaries, predictions_ridge)^2
+
+cat("The Mean Squared Error for the Ridge Regression Model is:", mse_ridge, fill = T)
+cat("The R squared value for the Ridge Regression Model is:", rsquared_ridge, fill = T)
+```
+
+The Ridge Regression model gives us a R-squared value of 0.4975825 and a MSE of 10.83925. These results are similar to that of the linear regression model. 
+
+Ridge Regression Coeffecient Analysis
+
+```{r}
+coefficients_df = data.frame(Feature = colnames(x), Coefficient = as.vector(coef(ridge_model, s = "lambda.min")[-1, ]))
+  
+ggplot(coefficients_df, aes(x = reorder(Feature, -Coefficient), y = Coefficient)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    labs(title = "Feature Importance from Ridge Regression",
+         x = "Feature",
+         y = "Coefficient")
+```
+
+From the graph above, we can ascertain that the most influential predictor variables are `PTS/G`, `Age`, and `DRB/G`. Interestingly, the `STL/G` and `BPM` displays a negative associations with salaries for the Ridge Regression Model. 
+
+
+Ridge Regression Summary 
+
+```{r}
+par(mfrow = c(2, 2))
+
+
+plot(true_salaries, predictions_ridge, main = "Actual vs. Predicted Salaries", xlab = "Actual Salaries", ylab = "Predicted Salaries")
+abline(0, 1, col = "red", lwd = 2)
+
+
+residuals = true_salaries - predictions_ridge
+plot(predictions_ridge, residuals, main = "Residual Plot", xlab = "Predicted Salaries", ylab = "Residuals")
+abline(h = 0, col = "red", lty = 2)
+
+
+hist(residuals, main = "Distribution of Residuals", xlab = "Residuals")
+
+
+qqnorm(residuals, main = "QQ Plot of Residuals")
+qqline(residuals, col = 2)
+```
+
+The Ridge Regression model overall yields a very similar performance to the linear regression model, as most of the residuals seem to be centered at 0, but due to the large salary numbers that we are working with, the overall MSE is extremely high. Furthermore, there seems to be some extreme outliars in terms of the residuals, which is probably subject to certain overpaid and underpaid players, and the residuals from the Ridge Regression Model are not normally distributed either. 
+
+
+
+Random Forest Model: The final method we will be using is the Random Forest model. We choose this model because unlike the linear regression and ridge regression model, the Random Forest model does not assume a linear relationship between our predictor variables and our target variable. Thus, it is able to capture complex, non-linear patterns in our data. Furthermore, the Random Forest model also has reduced senstivity to outliers. 
+
+```{r}
+library(randomForest)
+set.seed(2024)
+
+train_indices <- createDataPartition(nba_numerical$Salary, p = 0.8, list = FALSE)
+train_data <- nba_numerical[train_indices, ]
+test_data <- nba_numerical[-train_indices, ]
+
+preProcValues <- preProcess(train_data[, c("PTS/G", "Age", "AST/G", "STL/G", "VORP", "GS", "TOV/G", "DRB/G", "BPM")], method = c("center", "scale"))
+train_data_scaled <- predict(preProcValues, train_data)
+test_data_scaled <- predict(preProcValues, test_data)
+
+colnames(train_data_scaled) <- make.names(colnames(train_data_scaled))
+colnames(test_data_scaled) <- make.names(colnames(test_data_scaled))
+
+rf_model <- randomForest(Salary ~ ., data = train_data_scaled)
+
+predictions_rf <- predict(rf_model, newdata = test_data_scaled)
+
+mse_rf <- mean((true_salaries - predictions_rf)^2)
+rsquared_rf <- cor(true_salaries, predictions_rf)^2
+cat("The Mean Squared Error for the Random Forest Model:", mse_rf, fill = T)
+cat("The R Squared Value for the Random Forest Model:", rsquared_rf, fill = T)
+```
+
+The MSE for the Random Forest Model is 9.186334 and the Coefficient of Determination is 0.5743047. Thus, this method performs better than both linear regression and the ridge regression model. This makes sense as the Random Forest model is a non-parametric method, meaning it does not assume any sort of pre-existing relationship between our variables, which allows it to bypass the linearity assumption or constant variance assumption in the other models. 
+
+
+Random Forest Feature Analysis 
+
+```{r}
+feature_importance <- rf_model$importance[, "IncNodePurity"]
+sorted_importance <- feature_importance[order(-feature_importance)]
+barplot(sorted_importance, names.arg = c("PTS/G", "Age", "AST/G", "STL/G", "VORP", "GS", "TOV/G", "DRB/G", "BPM"), las = 2, main = "Random Forest Feature Importance")
+```
+
+Similar to the findings of the Ridge Regression model, the Random Forest model identified points, `PTS/G` and `Age` as significant factors in predicting salary. However, the most noticeable differnce  is that the Random Forest model ranks `DRB/G` lower and `STL/G` higher than the Ridge Regression model.
+
+
+Random Forest Summary 
+
+```{r}
+par(mfrow = c(2,2))
+
+plot(true_salaries, predictions_rf,
+     main = "Random Forest - Prediction vs. Actual",
+     xlab = "Actual Salary",
+     ylab = "Predicted Salary")
+abline(a = 0, b = 1, col = "red", lty = 2)
+
+residuals_rf <- true_salaries - predictions_rf
+
+plot(predictions_rf, residuals_rf,
+     main = "Random Forest - Residual Plot",
+     xlab = "Predicted Salary",
+     ylab = "Residuals")
+abline(h = 0, col = "red", lty = 2)
+
+hist(residuals_rf, main = "Distribution of Residuals", xlab = "Residuals")
+
+
+qqnorm(residuals_rf, main = "QQ Plot of Residuals")
+qqline(residuals, col = 2)
+```
+
+Overall, the Random Forest Method provides more residuals that are closer to zero compared to that of the linear regression model and the ridge regression model. This can be attributed to the fact that the Random Forest Model does not make any assumptions about the distribution of the data. However, there are still quite a few notable outliers, suggesting that certain players are way overpaid or way underpaid. 
+
+
+
+Discussion and Outlook:
+
+As noted throughout the project, there are a lot of outliers in our data set as a result of having extremely overpaid and underpaid players. These outliers deserve a closer look and the reasoning behind why they are such outliers should be discussed. Thus, in this portion, we will look at the most underpaid and overpaid players for each predictive model and have a short discussion about why these outliers exist. Then, at the end we will discuss the strengths and limitations of our approach in general and how our model can be improved moving forward. 
+
+
+Analysis of Outliers Using Linear Regression 
+
+```{r}
+set.seed(2024)
+nba_new_with_year = nba %>% dplyr::select(Player, Year, Salary, `PTS/G`, Age, `AST/G`, `STL/G`, `VORP`, `GS`, `TOV/G`, `DRB/G`, `BPM`)
+train_indices1 <- createDataPartition(nba_numerical$Salary, p = 0.8, list = FALSE)
+train_data1 <- nba_new_with_year[train_indices, ]
+test_data1 <- nba_new_with_year[-train_indices, ]
+
+player_names <- test_data1$Player
+player_year <- test_data1$Year
+actual_salaries <- test_data$Salary
+difference <- actual_salaries - predictions
+
+
+comparison_df <- data.frame(Player = player_names, 
+                            Year = player_year,
+                            Actual_Salary = actual_salaries, 
+                            Predicted_Salary = predictions,
+                            Difference = difference)
+
+
+ordered_df <- comparison_df[order(comparison_df$Difference, decreasing = TRUE), ]
+
+underpaid = tail(ordered_df, 10)
+underpaid_linear <- print(underpaid[nrow(underpaid):1, ])
+
+overpaid_linear = print(head(ordered_df, 10))
+```
+
+
+Analysis of Outliers Using Ridge Regression 
+
+```{r}
+set.seed(2024)
+nba_new_with_year = nba %>% dplyr::select(Player, Year, Salary, `PTS/G`, Age, `AST/G`, `STL/G`, `VORP`, `GS`, `TOV/G`, `DRB/G`, `BPM`)
+train_indices1 <- createDataPartition(nba_numerical$Salary, p = 0.8, list = FALSE)
+train_data1 <- nba_new_with_year[train_indices, ]
+test_data1 <- nba_new_with_year[-train_indices, ]
+
+player_names <- test_data1$Player
+player_year <- test_data1$Year
+actual_salaries <- test_data$Salary
+difference <- actual_salaries - predictions_ridge
+
+
+comparison_df_ridge <- data.frame(Player = player_names, 
+                            Year = player_year,
+                            Actual_Salary = actual_salaries, 
+                            Predicted_Salary = predictions_ridge,
+                            Difference = difference)
+
+colnames(comparison_df_ridge)[colnames(comparison_df_ridge) == "lambda.min"] <- "Predicted_Salary"
+colnames(comparison_df_ridge)[colnames(comparison_df_ridge) == "lambda.min.1"] <- "Difference"
+
+ordered_df_ridge <- comparison_df_ridge[order(comparison_df_ridge$Difference, decreasing = TRUE), ]
+
+underpaid = tail(ordered_df_ridge, 10)
+underpaid_ridge <- print(underpaid[nrow(underpaid):1, ])
+
+overpaid_ridge = print(head(ordered_df_ridge, 10))
+```
+
+
+Analysis of Outliers using Random Forest 
+
+```{r}
+set.seed(2024)
+nba_new_with_year = nba %>% dplyr::select(Player, Year, Salary, `PTS/G`, Age, `AST/G`, `STL/G`, `VORP`, `GS`, `TOV/G`, `DRB/G`, `BPM`)
+train_indices1 <- createDataPartition(nba_numerical$Salary, p = 0.8, list = FALSE)
+train_data1 <- nba_new_with_year[train_indices, ]
+test_data1 <- nba_new_with_year[-train_indices, ]
+
+player_names <- test_data1$Player
+player_year <- test_data1$Year
+actual_salaries <- test_data$Salary
+difference <- actual_salaries - predictions_rf
+
+
+comparison_df_rf <- data.frame(Player = player_names, 
+                            Year = player_year,
+                            Actual_Salary = actual_salaries, 
+                            Predicted_Salary = predictions_rf,
+                            Difference = difference)
+
+# Order the data frame by the Difference column in descending order
+ordered_df_rf <- comparison_df_rf[order(comparison_df_rf$Difference, decreasing = TRUE), ]
+
+# Print the ordered data frame
+underpaid = tail(ordered_df_rf, 10)
+underpaid_rf <- print(underpaid[nrow(underpaid):1, ])
+
+# Print the ordered data frame
+overpaid_rf = print(head(ordered_df_rf, 10))
+```
+
+
+The tables above show the most underpaid and overpaid players according to each one of our models. A preliminary glimpse of the most underpaid players, signified by the negative difference value, shows that the majority of the players on this list are on their rookie contracts. Upon getting drafted, players will often negotiate a 3-5 year rookie contract, and these rookie contracts are often extremely cheap as these players are unproven commodities. Thus, when players perform much better than expected a younger age, these contracts look like steals and the players seem underpaid. Reggie Evans, Jimmy Butler, Aaron Brooks, Demarcus Cousins, and Nikola Vucevic are on all three lists of underpaid players and all of them were on their rookie contracts during the year listed. On the otherhand, the opposite phenomenon can be observed from the overpaid players list. Many older players, especially those who are entering the tail end of their career, command a lot of respect within the league, as a result of their prolonged tenure. This leads to teams overpaying them and giving them massive contracts for the player they used to be rather than what they currently are. This can be seen in Derrick Rose, Rashard Lewis, Kobe Bryant, Danny Granger's contracts, as all of these players were great in the 2000s, but none of them were on a roster by 2020. Furthermore, several of these players experienced severe injuries, limiting their production on the court during that year. Paul George, Chris Paul, Yao Ming, and Michael Redd fit this category, as all of them experience terrible injuries, cutting their season short. 
+
+
+Overall Discussion and Outlook on Future Improvements: 
+
+Through our analysis of the largest residuals for all three of our models, we can ascertain a basic idea of what our strengths and limitations of our models were. The biggest strengths in our models is that all three of the models seem to be able to capture the player's relative on court performance, as the players who seem the most underpaid performed great for the year listed, and the players who seem the most overpaid performed not so great for the year listed. Thus, we can be somewhat certain that our models is able to accurately judge how good a player actually performs on the court. However, a weakness of our models is that we did not factor in other variables such as how long a player has been in the league or their injury status. As we discussed above, both of these variables have a significant impact on our prediction models, since they are the most probable explanation for the majority of the largest residuals. 
+
+Thus, looking forward in terms of improvements on our models, adding a continuous variable signifying how long a player has been in the league and a categorical variable for their injury status would be the first and most obvious improvements. Furthermore, another improvement that can be made would be the rounding or grouping of salary values. In all of our models, we are trying to predict a player's salary down to the dollar. This is extremely hard as since most players salaries are in the multimillions, getting the specific value from a prediction value is unlikely. Thus, it may be worth trying to round each player's salary to the nearest million and then grouping them into bins of salary ranges. This may make our models more accurate, as instead of trying to predict their exact salary, we would be trying to predict the salary range that they would fall under. It also may be more practical, as in real life, contracts are often signed after negotiations, so setting a salary range for a player may help inform a team how much general flexibility they have to negotiate with. 
+
+
+Conclusion: 
+
+This data project set out with the hope to be able to analyze and predict how much a player should be paid based off of statistics tracking their on court performance. Upon a little bit of preliminary exploratory data analysis, we were able to ascertain that the gross majority of players get paid less than $5 million a year, yet some get paid upward of $25 million a year. This means that there must be certain on-court factors that have a high impact on a player's respective salary. Through a correlation heatmap. we were able to ascertain which variables were most correlated with a player's salary. The impact of these variables were further supported through a basic data table showing how certain variables, such as the PPG, increase along with salary. Then, we constructed three different prediction models using different methods for each one. All three models attempted to predict a player's salary using the same 9 variables; PTS/G (Points Per Game), Age, AST/G (Assists Per Game), STL/G (Steals Per Game), VORP (Value Over Replacement Player), GS (Games Started), TOV/G (Turnovers Per Game), DRB/G (Defensive Rebounds Per Game), BPM (Box Plus Minus). We measured the performance of each of the models through two statistics, the Mean Squared Error, or MSE, and the Coefficient of Determination, or R squared. Lower values of MSE and higher values of R squared meant better performing models. We subsetted our data set into a training and testing set, constructed each of our predictive models using the training set, tested it on the testing set, and then reported the results. We also plotted the residuals for each model in order to have a visual understanding about the performance of our models. As a result of these tests, we found that the model constructed using a Random Forest method was the best model, as it had the lowest MSE and highest R squared values. Then we looked at the largest outliers for each model to see if there was a pattern amongst them that we could fix in future models. We found that our largest residuals for each model were explained largely by how long a given player had been playing and their injury status. Thus, our final conclusion is that a Random Forest algorithm is the best model for predicting player salaries using their on-court statistics, and that future improvements may make this model even more accurate. 
+
+
+
